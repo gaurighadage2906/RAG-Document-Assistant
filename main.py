@@ -1,13 +1,14 @@
 
 import hashlib
+import os
 from io import BytesIO
 from pathlib import Path
 
 import chromadb
-import ollama
 import streamlit as st
 import tiktoken
 
+from openai import OpenAI
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
@@ -16,20 +17,16 @@ from sentence_transformers import SentenceTransformer
 # 1. CONFIGURATION
 # ==================================================
 
-OLLAMA_MODEL = "llama3.2:3b"
+HF_MODEL = "openai/gpt-oss-120b:fastest"
+HF_BASE_URL = "https://router.huggingface.co/v1"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-OLLAMA_HOST = "http://localhost:11434"
-
 DB_PATH = "./vector_db"
-
 COLLECTION_NAME = "rag_documents"
 
 CHUNK_SIZE = 500
-
 CHUNK_OVERLAP = 80
-
 TOP_K = 4
 
 
@@ -46,7 +43,6 @@ st.set_page_config(
 
 @st.cache_resource
 def load_embedding_model():
-
     return SentenceTransformer(EMBEDDING_MODEL)
 
 
@@ -81,40 +77,36 @@ collection = get_collection()
 
 
 # ==================================================
-# 4. CONNECT TO LOCAL OLLAMA
+# 4. CONNECT TO HUGGING FACE
 # ==================================================
 
 @st.cache_resource
-def get_ollama_client():
+def get_hf_client():
 
-    client = ollama.Client(
-        host=OLLAMA_HOST,
+    token = os.getenv("HF_TOKEN")
+
+    if not token:
+        return None
+
+    return OpenAI(
+        base_url=HF_BASE_URL,
+        api_key=token,
         timeout=120
     )
 
-    return client
 
-
-ollama_client = get_ollama_client()
+hf_client = None
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
 
 # ==================================================
-# 5. CHECK OLLAMA CONNECTION
+# 5. CHECK HUGGING FACE CONFIGURATION
 # ==================================================
 
-def check_ollama_connection():
+def check_hf_configuration():
 
-    try:
-
-        ollama_client.list()
-
-        return True
-
-    except Exception:
-
-        return False
+    return hf_client is not None
 
 
 # ==================================================
@@ -204,19 +196,15 @@ def process_document(uploaded_file):
     pages = extract_text(uploaded_file)
 
     if not pages:
-
         return 0
 
     all_chunks = []
-
     all_metadata = []
-
     all_ids = []
 
     for page_data in pages:
 
         page_text = page_data["text"]
-
         page_number = page_data["page"]
 
         chunks = split_into_chunks(page_text)
@@ -242,7 +230,6 @@ def process_document(uploaded_file):
             all_ids.append(chunk_id)
 
     if not all_chunks:
-
         return 0
 
     embeddings = embedding_model.encode(
@@ -269,7 +256,6 @@ def retrieve_documents(question):
     total_chunks = collection.count()
 
     if total_chunks == 0:
-
         return []
 
     query_embedding = embedding_model.encode(
@@ -292,9 +278,7 @@ def retrieve_documents(question):
     if results["documents"]:
 
         documents = results["documents"][0]
-
         metadatas = results["metadatas"][0]
-
         distances = results["distances"][0]
 
         for document, metadata, distance in zip(
@@ -325,10 +309,17 @@ def retrieve_documents(question):
 
 
 # ==================================================
-# 10. GENERATE ANSWER USING LOCAL OLLAMA
+# 10. GENERATE ANSWER USING HUGGING FACE
 # ==================================================
 
 def generate_answer(question, retrieved_documents):
+
+    if not hf_client:
+
+        raise ValueError(
+            "Hugging Face token is not configured. "
+            "Add HF_TOKEN to your environment variables."
+        )
 
     if not retrieved_documents:
 
@@ -365,7 +356,6 @@ def generate_answer(question, retrieved_documents):
     Answer questions using ONLY the provided document context.
 
     Rules:
-
     1. Do not invent facts.
     2. Do not use outside knowledge to fill missing information.
     3. If the answer is not available in the context,
@@ -388,9 +378,9 @@ def generate_answer(question, retrieved_documents):
     Answer using only the retrieved context.
     """
 
-    response = ollama_client.chat(
+    response = hf_client.chat.completions.create(
 
-        model=OLLAMA_MODEL,
+        model=HF_MODEL,
 
         messages=[
             {
@@ -403,14 +393,17 @@ def generate_answer(question, retrieved_documents):
             }
         ],
 
-        options={
-            "temperature": 0.2
-        },
+        temperature=0.2,
 
-        stream=False
+        max_tokens=700
     )
 
-    return response.message.content
+    answer = response.choices[0].message.content
+
+    if not answer:
+        raise ValueError("The AI provider returned an empty answer.")
+
+    return answer
 
 
 # ==================================================
@@ -424,37 +417,37 @@ st.write(
     Upload your documents and ask questions.
 
     The application retrieves relevant document content
-    and generates answers using a local Ollama AI model.
+    and generates answers using a hosted AI model.
     """
 )
 
 st.caption(
-    f"AI Model: {OLLAMA_MODEL} | "
+    f"AI Model: {HF_MODEL} | "
     f"Embedding Model: {EMBEDDING_MODEL}"
 )
 
 
 # ==================================================
-# 12. OLLAMA STATUS
+# 12. HUGGING FACE STATUS
 # ==================================================
 
 st.header("System Status")
 
-if check_ollama_connection():
+if check_hf_configuration():
 
     st.success(
-        "Ollama is connected and ready."
+        "Hugging Face token is configured."
     )
 
 else:
 
     st.error(
-        "Ollama is not running. "
-        "Please start Ollama before asking questions."
+        "Hugging Face token is not configured."
     )
 
     st.info(
-        "Open another PowerShell terminal and run: ollama serve"
+        "Add HF_TOKEN to your environment variables "
+        "before asking questions."
     )
 
 
@@ -593,92 +586,95 @@ for message in st.session_state.messages:
 # 17. QUESTION AND ANSWER
 # ==================================================
 
+
+# ==================================================
+# 17. QUESTION AND ANSWER
+# ==================================================
+
 question = st.chat_input(
     "Ask a question about your uploaded documents..."
 )
 
-
 if question:
 
     st.session_state.messages.append({
-
         "role": "user",
-
         "content": question
-
     })
 
     with st.chat_message("user"):
-
         st.markdown(question)
 
     with st.chat_message("assistant"):
 
-        with st.spinner(
-            "Retrieving documents and generating answer..."
-        ):
+        with st.spinner("Searching your documents..."):
 
-            try:
+            retrieved_documents = retrieve_documents(question)
 
-                if not check_ollama_connection():
+            if not retrieved_documents:
 
-                    raise ConnectionError(
-                        "Ollama is not running. "
-                        "Please start Ollama and try again."
+                answer = (
+                    "No relevant information was found. "
+                    "Please upload and process a document first."
+                )
+
+                st.warning(answer)
+
+            else:
+
+                if hf_client:
+
+                    try:
+                        answer = generate_answer(
+                            question,
+                            retrieved_documents
+                        )
+
+                        st.markdown(answer)
+
+                    except Exception as error:
+
+                        answer = (
+                            "Document retrieval was successful, "
+                            "but hosted AI answer generation is "
+                            "currently unavailable."
+                        )
+
+                        st.warning(answer)
+                        st.caption(f"Provider error: {error}")
+
+                else:
+
+                    answer = (
+                        "Relevant document passages were retrieved "
+                        "successfully. AI answer generation is "
+                        "currently disabled in this demo."
                     )
 
-                retrieved_documents = retrieve_documents(
-                    question
-                )
+                    st.info(answer)
 
-                answer = generate_answer(
-                    question,
-                    retrieved_documents
-                )
+                with st.expander("View retrieved sources"):
 
-                st.markdown(answer)
-
-                if retrieved_documents:
-
-                    with st.expander(
-                        "View retrieved sources"
+                    for index, source in enumerate(
+                        retrieved_documents,
+                        start=1
                     ):
 
-                        for index, source in enumerate(
-                            retrieved_documents,
-                            start=1
-                        ):
+                        st.markdown(
+                            f"**Source {index}: {source['source']}**"
+                        )
 
-                            st.markdown(
-                                f"**Source {index}: "
-                                f"{source['source']}**"
-                            )
+                        st.write(f"Page: {source['page']}")
 
-                            st.write(
-                                f"Page: {source['page']}"
-                            )
+                        st.write(source["text"])
 
-                            st.write(
-                                source["text"]
-                            )
+                        st.divider()
 
-                            st.divider()
-
-                st.session_state.messages.append({
-
-                    "role": "assistant",
-
-                    "content": answer,
-
-                    "sources": retrieved_documents
-
-                })
-
-            except Exception as error:
-
-                st.error(
-                    f"Answer generation failed: {error}"
-                )
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+                "sources": retrieved_documents
+            })
 
 
 # ==================================================
@@ -701,5 +697,5 @@ st.divider()
 st.caption(
     "RAG Document Assistant | "
     "Python + Streamlit + ChromaDB + "
-    "Sentence Transformers + Local Ollama"
+    "Sentence Transformers + Hugging Face Inference"
 )
