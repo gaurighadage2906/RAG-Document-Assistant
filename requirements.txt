@@ -2,6 +2,4 @@ streamlit
 chromadb
 sentence-transformers
 pypdf
-ollama
 tiktoken
-openai
