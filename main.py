@@ -1,14 +1,10 @@
 
-import os
 import io
-import hashlib
-
+import re
+import math
 import streamlit as st
-import chromadb
-import tiktoken
-
+from collections import Counter
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
 
 # ==========================================
@@ -24,165 +20,93 @@ st.set_page_config(
 st.title("📚 RAG Document Assistant")
 
 st.write(
-    "Upload documents, process them, and retrieve "
-    "relevant information using semantic search."
+    "Upload PDF, TXT or Markdown documents, "
+    "process them and retrieve relevant passages."
 )
 
-
-# ==========================================
-# 2. CONFIGURATION
-# ==========================================
-
-DB_PATH = "./vector_db"
-COLLECTION_NAME = "rag_documents"
-
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 80
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
 TOP_K = 4
+MAX_FILE_SIZE = 10 * 1024 * 1024
 
 
 # ==========================================
-# 3. LOAD TOKENIZER
+# 2. SESSION STORAGE
 # ==========================================
 
-@st.cache_resource
-def load_tokenizer():
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
 
-    return tiktoken.get_encoding("cl100k_base")
-
-
-# ==========================================
-# 4. LOAD EMBEDDING MODEL
-# ==========================================
-
-@st.cache_resource
-def load_embedding_model():
-
-    return SentenceTransformer(EMBEDDING_MODEL)
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = []
 
 
 # ==========================================
-# 5. CONNECT TO CHROMADB
-# ==========================================
-
-@st.cache_resource
-def get_collection():
-
-    os.makedirs(DB_PATH, exist_ok=True)
-
-    client = chromadb.PersistentClient(
-        path=DB_PATH
-    )
-
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"}
-    )
-
-    return collection
-
-
-# ==========================================
-# 6. EXTRACT DOCUMENT TEXT
+# 3. TEXT EXTRACTION
 # ==========================================
 
 def extract_text(uploaded_file):
 
     filename = uploaded_file.name
-
     file_bytes = uploaded_file.getvalue()
 
-    pages = []
+    if filename.lower().endswith(".pdf"):
 
-    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
 
-        if filename.lower().endswith(".pdf"):
+        pages = []
 
-            pdf = PdfReader(
-                io.BytesIO(file_bytes)
-            )
-
-            for page_number, page in enumerate(
-                pdf.pages,
-                start=1
-            ):
-
-                text = page.extract_text() or ""
-
-                if text.strip():
-
-                    pages.append({
-                        "text": text,
-                        "page": page_number
-                    })
-
-        elif filename.lower().endswith(
-            (".txt", ".md")
+        for page_number, page in enumerate(
+            reader.pages, start=1
         ):
 
-            text = file_bytes.decode(
-                "utf-8",
-                errors="replace"
-            )
+            text = page.extract_text() or ""
 
             if text.strip():
-
                 pages.append({
                     "text": text,
-                    "page": 1
+                    "page": page_number
                 })
-
-        else:
-
-            raise ValueError(
-                "Unsupported file format."
-            )
 
         return pages
 
-    except Exception as error:
+    if filename.lower().endswith((".txt", ".md")):
 
-        st.error(
-            f"Error reading {filename}: {error}"
+        text = file_bytes.decode(
+            "utf-8",
+            errors="replace"
         )
 
-        return []
+        return [{
+            "text": text,
+            "page": 1
+        }] if text.strip() else []
+
+    raise ValueError("Unsupported file format.")
 
 
 # ==========================================
-# 7. SPLIT TEXT INTO CHUNKS
+# 4. TEXT CHUNKING
 # ==========================================
 
-def split_text_into_chunks(text):
+def split_into_chunks(text):
 
-    tokenizer = load_tokenizer()
-
-    tokens = tokenizer.encode(text)
+    words = text.split()
 
     chunks = []
 
     start = 0
 
-    while start < len(tokens):
+    while start < len(words):
 
         end = start + CHUNK_SIZE
 
-        chunk_tokens = tokens[start:end]
+        chunk = " ".join(words[start:end])
 
-        chunk_text = tokenizer.decode(
-            chunk_tokens
-        )
+        if chunk.strip():
+            chunks.append(chunk)
 
-        if chunk_text.strip():
-
-            chunks.append(
-                chunk_text.strip()
-            )
-
-        if end >= len(tokens):
-
+        if end >= len(words):
             break
 
         start = end - CHUNK_OVERLAP
@@ -191,219 +115,206 @@ def split_text_into_chunks(text):
 
 
 # ==========================================
-# 8. PROCESS DOCUMENTS
+# 5. PROCESS DOCUMENTS
 # ==========================================
 
 def process_documents(uploaded_files):
 
-    model = load_embedding_model()
-
-    collection = get_collection()
-
-    total_chunks = 0
+    all_chunks = []
 
     progress = st.progress(0)
 
     status = st.empty()
 
-    for file_index, uploaded_file in enumerate(
-        uploaded_files
-    ):
+    for index, uploaded_file in enumerate(uploaded_files):
 
         filename = uploaded_file.name
 
-        status.write(
-            f"Processing {filename}..."
-        )
+        status.write(f"Processing {filename}...")
 
-        pages = extract_text(uploaded_file)
-
-        if not pages:
-
+        if uploaded_file.size > MAX_FILE_SIZE:
+            st.warning(
+                f"Skipped {filename}: maximum size is 10 MB."
+            )
+            progress.progress(
+                (index + 1) / len(uploaded_files)
+            )
             continue
 
-        # Remove old chunks for this filename
-        collection.delete(
-            where={"source": filename}
-        )
+        try:
 
-        documents = []
+            pages = extract_text(uploaded_file)
 
-        metadatas = []
+            for page_data in pages:
 
-        ids = []
-
-        for page_data in pages:
-
-            page_text = page_data["text"]
-
-            page_number = page_data["page"]
-
-            chunks = split_text_into_chunks(
-                page_text
-            )
-
-            for chunk_index, chunk in enumerate(
-                chunks
-            ):
-
-                unique_value = (
-                    f"{filename}_{page_number}_"
-                    f"{chunk_index}_{chunk}"
+                page_chunks = split_into_chunks(
+                    page_data["text"]
                 )
 
-                chunk_id = hashlib.sha256(
-                    unique_value.encode("utf-8")
-                ).hexdigest()
+                for chunk_index, chunk in enumerate(
+                    page_chunks
+                ):
 
-                documents.append(chunk)
+                    all_chunks.append({
+                        "text": chunk,
+                        "source": filename,
+                        "page": page_data["page"],
+                        "chunk_index": chunk_index
+                    })
 
-                metadatas.append({
-                    "source": filename,
-                    "page": int(page_number),
-                    "chunk_index": int(chunk_index)
-                })
+        except Exception as error:
 
-                ids.append(chunk_id)
-
-        if documents:
-
-            embeddings = model.encode(
-                documents,
-                convert_to_numpy=True
-            ).tolist()
-
-            collection.upsert(
-                ids=ids,
-                documents=documents,
-                embeddings=embeddings,
-                metadatas=metadatas
+            st.warning(
+                f"Could not process {filename}: {error}"
             )
 
-            total_chunks += len(documents)
-
         progress.progress(
-            (file_index + 1) / len(uploaded_files)
+            (index + 1) / len(uploaded_files)
         )
 
-    status.success(
-        "Document processing completed!"
-    )
+    # Replace the current knowledge base
+    st.session_state.chunks = all_chunks
 
-    return total_chunks
+    st.session_state.processed_files = [
+        file.name for file in uploaded_files
+    ]
+
+    status.success("Document processing completed!")
+
+    return len(all_chunks)
 
 
 # ==========================================
-# 9. RETRIEVE DOCUMENTS
+# 6. TEXT TOKENIZATION
+# ==========================================
+
+def tokenize(text):
+
+    return re.findall(
+        r"[a-zA-Z0-9]+",
+        text.lower()
+    )
+
+
+# ==========================================
+# 7. BM25 RETRIEVAL
 # ==========================================
 
 def retrieve_documents(question):
 
-    model = load_embedding_model()
+    documents = st.session_state.chunks
 
-    collection = get_collection()
-
-    if collection.count() == 0:
-
+    if not documents:
         return []
 
-    query_embedding = model.encode(
-        question,
-        convert_to_numpy=True
-    ).tolist()
+    query_terms = tokenize(question)
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(
-            TOP_K,
-            collection.count()
-        ),
-        include=[
-            "documents",
-            "metadatas",
-            "distances"
-        ]
+    if not query_terms:
+        return []
+
+    tokenized_docs = [
+        tokenize(item["text"])
+        for item in documents
+    ]
+
+    document_count = len(tokenized_docs)
+
+    average_length = (
+        sum(len(doc) for doc in tokenized_docs)
+        / document_count
     )
 
-    retrieved = []
+    if average_length == 0:
+        return []
 
-    documents = results["documents"][0]
+    document_frequencies = Counter()
 
-    metadatas = results["metadatas"][0]
+    for tokens in tokenized_docs:
+        document_frequencies.update(set(tokens))
 
-    distances = results["distances"][0]
+    k1 = 1.5
+    b = 0.75
 
-    for document, metadata, distance in zip(
-        documents,
-        metadatas,
-        distances
-    ):
+    scored_results = []
 
-        retrieved.append({
-            "text": document,
-            "source": metadata.get(
-                "source",
-                "Unknown"
-            ),
-            "page": metadata.get(
-                "page",
-                "N/A"
-            ),
-            "distance": distance
-        })
+    for index, tokens in enumerate(tokenized_docs):
 
-    return retrieved
+        term_counts = Counter(tokens)
+
+        document_length = len(tokens)
+
+        score = 0.0
+
+        for term in set(query_terms):
+
+            frequency = term_counts.get(term, 0)
+
+            if frequency == 0:
+                continue
+
+            df = document_frequencies[term]
+
+            idf = math.log(
+                1 + (
+                    document_count - df + 0.5
+                ) / (df + 0.5)
+            )
+
+            denominator = frequency + k1 * (
+                1 - b + b * (
+                    document_length / average_length
+                )
+            )
+
+            score += idf * (
+                frequency * (k1 + 1)
+            ) / denominator
+
+        if score > 0:
+
+            result = documents[index].copy()
+
+            result["score"] = score
+
+            scored_results.append(result)
+
+    scored_results.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return scored_results[:TOP_K]
 
 
 # ==========================================
-# 10. SIDEBAR
+# 8. SIDEBAR
 # ==========================================
 
 with st.sidebar:
 
     st.header("Project Settings")
 
-    st.write(
-        "**Embedding Model**"
-    )
+    st.write("**Retrieval Method**")
+    st.code("BM25 Keyword Retrieval")
 
-    st.code(EMBEDDING_MODEL)
+    st.write("**Chunk Size:**", CHUNK_SIZE)
 
-    st.write(
-        "**Vector Database**"
-    )
+    st.write("**Chunk Overlap:**", CHUNK_OVERLAP)
 
-    st.code("ChromaDB")
-
-    st.write(
-        "**Chunk Size:**",
-        CHUNK_SIZE
-    )
-
-    st.write(
-        "**Chunk Overlap:**",
-        CHUNK_OVERLAP
-    )
-
-    st.write(
-        "**Top K:**",
-        TOP_K
-    )
+    st.write("**Top Results:**", TOP_K)
 
     st.divider()
 
-    st.success(
-        "Retrieval mode active"
-    )
+    st.success("Lightweight retrieval mode active")
 
     st.info(
-        "No Hugging Face token or OpenAI API key "
-        "is required for document retrieval."
+        "No OpenAI key, Hugging Face token, "
+        "or embedding model is required."
     )
 
 
 # ==========================================
-# 11. DOCUMENT UPLOAD
+# 9. DOCUMENT UPLOAD
 # ==========================================
 
 st.header("1. Upload Documents")
@@ -425,24 +336,18 @@ if uploaded_files:
             f"({file.size / 1024:.2f} KB)"
         )
 
-    if st.button(
-        "Process Documents",
-        type="primary"
-    ):
+    if st.button("Process Documents", type="primary"):
 
         try:
 
-            with st.spinner(
-                "Processing documents..."
-            ):
+            with st.spinner("Processing documents..."):
 
                 total_chunks = process_documents(
                     uploaded_files
                 )
 
             st.success(
-                f"Successfully processed "
-                f"{total_chunks} chunks!"
+                f"Successfully processed {total_chunks} chunks!"
             )
 
         except Exception as error:
@@ -453,40 +358,35 @@ if uploaded_files:
 
 
 # ==========================================
-# 12. DATABASE STATUS
+# 10. KNOWLEDGE BASE STATUS
 # ==========================================
 
 st.divider()
 
 st.header("2. Knowledge Base Status")
 
-try:
+col1, col2 = st.columns(2)
 
-    collection = get_collection()
+col1.metric(
+    "Stored Chunks",
+    len(st.session_state.chunks)
+)
 
-    count = collection.count()
+col2.metric(
+    "Processed Documents",
+    len(st.session_state.processed_files)
+)
 
-    col1, col2 = st.columns(2)
+if st.session_state.processed_files:
 
-    col1.metric(
-        "Stored Chunks",
-        count
-    )
+    st.write("**Processed files:**")
 
-    col2.metric(
-        "Top Retrieved Results",
-        TOP_K
-    )
-
-except Exception as error:
-
-    st.error(
-        f"Database error: {error}"
-    )
+    for filename in st.session_state.processed_files:
+        st.write(f"📄 {filename}")
 
 
 # ==========================================
-# 13. ASK QUESTIONS
+# 11. ASK QUESTIONS
 # ==========================================
 
 st.divider()
@@ -502,59 +402,52 @@ if st.button("Retrieve Relevant Information"):
 
     if not question.strip():
 
+        st.warning("Please enter a question.")
+
+    elif not st.session_state.chunks:
+
         st.warning(
-            "Please enter a question."
+            "Please upload and process documents first."
         )
 
     else:
 
         try:
 
-            with st.spinner(
-                "Searching documents..."
-            ):
+            with st.spinner("Searching documents..."):
 
-                results = retrieve_documents(
-                    question
-                )
+                results = retrieve_documents(question)
 
             if not results:
 
                 st.warning(
-                    "No documents found. "
-                    "Please upload and process documents first."
+                    "No matching passages found. "
+                    "Try using different keywords."
                 )
 
             else:
 
                 st.success(
-                    f"Retrieved {len(results)} relevant chunks."
+                    f"Retrieved {len(results)} relevant passages."
                 )
 
-                st.subheader(
-                    "Retrieved Information"
-                )
+                st.subheader("Retrieved Information")
 
                 for index, result in enumerate(
-                    results,
-                    start=1
+                    results, start=1
                 ):
 
                     with st.expander(
                         f"Result {index}: {result['source']}"
                     ):
 
-                        st.write(
-                            result["text"]
-                        )
+                        st.write(result["text"])
 
                         st.caption(
                             f"Source: {result['source']} | "
                             f"Page: {result['page']} | "
-                            f"Distance: {result['distance']:.4f}"
+                            f"BM25 Score: {result['score']:.4f}"
                         )
-
-                st.divider()
 
                 st.subheader("Sources")
 
@@ -565,7 +458,6 @@ if st.button("Retrieve Relevant Information"):
                     source = result["source"]
 
                     if source not in unique_sources:
-
                         unique_sources[source] = set()
 
                     unique_sources[source].add(
@@ -575,7 +467,7 @@ if st.button("Retrieve Relevant Information"):
                 for source, pages in unique_sources.items():
 
                     page_list = ", ".join(
-                        sorted(pages)
+                        sorted(pages, key=lambda x: int(x))
                     )
 
                     st.write(
@@ -583,26 +475,22 @@ if st.button("Retrieve Relevant Information"):
                     )
 
                 st.info(
-                    "Document retrieval completed. "
-                    "AI-generated answer generation is disabled "
-                    "in this deployment version."
+                    "Retrieval completed. "
+                    "This lightweight deployment uses keyword-based "
+                    "BM25 retrieval, not semantic embeddings or "
+                    "AI-generated answers."
                 )
-
         except Exception as error:
-
-            st.error(
-                f"Retrieval failed: {error}"
-            )
+            st.error(f"Retrieval failed: {error}")
 
 
 # ==========================================
-# 14. FOOTER
+# 12. FOOTER
 # ==========================================
 
 st.divider()
 
 st.caption(
     "RAG Document Assistant | "
-    "Python | Streamlit | ChromaDB | "
-    "Sentence Transformers"
+    "Python | Streamlit | PyPDF | BM25"
 )
