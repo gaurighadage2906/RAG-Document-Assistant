@@ -20,18 +20,23 @@ st.set_page_config(
 st.title("📚 RAG Document Assistant")
 
 st.write(
-    "Upload PDF, TXT or Markdown documents, "
-    "process them and retrieve relevant passages."
+    "Upload documents, ask questions, and retrieve "
+    "relevant answers from your documents."
 )
+
+
+# ==========================================
+# 2. CONFIGURATION
+# ==========================================
 
 CHUNK_SIZE = 300
 CHUNK_OVERLAP = 50
 TOP_K = 4
-MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_FILE_SIZE_MB = 10
 
 
 # ==========================================
-# 2. SESSION STORAGE
+# 3. SESSION STATE
 # ==========================================
 
 if "chunks" not in st.session_state:
@@ -40,56 +45,81 @@ if "chunks" not in st.session_state:
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = []
 
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = None
+
 
 # ==========================================
-# 3. TEXT EXTRACTION
+# 4. TEXT TOKENIZATION
+# ==========================================
+
+def tokenize(text):
+
+    return re.findall(
+        r"\b[a-zA-Z0-9]+\b",
+        text.lower()
+    )
+
+
+# ==========================================
+# 5. TEXT EXTRACTION
 # ==========================================
 
 def extract_text(uploaded_file):
 
     filename = uploaded_file.name
-    file_bytes = uploaded_file.getvalue()
 
-    if filename.lower().endswith(".pdf"):
+    file_extension = filename.lower().split(".")[-1]
 
-        reader = PdfReader(io.BytesIO(file_bytes))
+    if file_extension == "pdf":
 
-        pages = []
+        pdf_reader = PdfReader(
+            io.BytesIO(uploaded_file.getvalue())
+        )
+
+        extracted_pages = []
 
         for page_number, page in enumerate(
-            reader.pages, start=1
+            pdf_reader.pages,
+            start=1
         ):
 
             text = page.extract_text() or ""
 
             if text.strip():
-                pages.append({
+
+                extracted_pages.append({
                     "text": text,
                     "page": page_number
                 })
 
-        return pages
+        return extracted_pages
 
-    if filename.lower().endswith((".txt", ".md")):
+    elif file_extension in ["txt", "md"]:
 
-        text = file_bytes.decode(
+        content = uploaded_file.getvalue().decode(
             "utf-8",
             errors="replace"
         )
 
         return [{
-            "text": text,
+            "text": content,
             "page": 1
-        }] if text.strip() else []
+        }]
 
-    raise ValueError("Unsupported file format.")
+    else:
+
+        raise ValueError(
+            "Unsupported file format. "
+            "Please upload PDF, TXT, or MD files."
+        )
 
 
 # ==========================================
-# 4. TEXT CHUNKING
+# 6. DOCUMENT CHUNKING
 # ==========================================
 
-def split_into_chunks(text):
+def create_chunks(text, source, page):
 
     words = text.split()
 
@@ -101,10 +131,17 @@ def split_into_chunks(text):
 
         end = start + CHUNK_SIZE
 
-        chunk = " ".join(words[start:end])
+        chunk_text = " ".join(
+            words[start:end]
+        )
 
-        if chunk.strip():
-            chunks.append(chunk)
+        if chunk_text.strip():
+
+            chunks.append({
+                "text": chunk_text,
+                "source": source,
+                "page": page
+            })
 
         if end >= len(words):
             break
@@ -115,89 +152,55 @@ def split_into_chunks(text):
 
 
 # ==========================================
-# 5. PROCESS DOCUMENTS
+# 7. DOCUMENT PROCESSING
 # ==========================================
 
 def process_documents(uploaded_files):
 
     all_chunks = []
 
-    progress = st.progress(0)
+    processed_files = []
 
-    status = st.empty()
+    for uploaded_file in uploaded_files:
 
-    for index, uploaded_file in enumerate(uploaded_files):
+        if uploaded_file.size > MAX_FILE_SIZE_MB * 1024 * 1024:
 
-        filename = uploaded_file.name
-
-        status.write(f"Processing {filename}...")
-
-        if uploaded_file.size > MAX_FILE_SIZE:
-            st.warning(
-                f"Skipped {filename}: maximum size is 10 MB."
+            raise ValueError(
+                f"{uploaded_file.name} exceeds "
+                f"the {MAX_FILE_SIZE_MB} MB limit."
             )
-            progress.progress(
-                (index + 1) / len(uploaded_files)
-            )
+
+        pages = extract_text(uploaded_file)
+
+        if not pages:
+
             continue
 
-        try:
+        file_chunks = []
 
-            pages = extract_text(uploaded_file)
+        for page_data in pages:
 
-            for page_data in pages:
-
-                page_chunks = split_into_chunks(
-                    page_data["text"]
-                )
-
-                for chunk_index, chunk in enumerate(
-                    page_chunks
-                ):
-
-                    all_chunks.append({
-                        "text": chunk,
-                        "source": filename,
-                        "page": page_data["page"],
-                        "chunk_index": chunk_index
-                    })
-
-        except Exception as error:
-
-            st.warning(
-                f"Could not process {filename}: {error}"
+            page_chunks = create_chunks(
+                page_data["text"],
+                uploaded_file.name,
+                page_data["page"]
             )
 
-        progress.progress(
-            (index + 1) / len(uploaded_files)
-        )
+            file_chunks.extend(page_chunks)
 
-    # Replace the current knowledge base
-    st.session_state.chunks = all_chunks
+        all_chunks.extend(file_chunks)
 
-    st.session_state.processed_files = [
-        file.name for file in uploaded_files
-    ]
+        if file_chunks:
 
-    status.success("Document processing completed!")
+            processed_files.append(
+                uploaded_file.name
+            )
 
-    return len(all_chunks)
+    return all_chunks, processed_files
 
 
 # ==========================================
-# 6. TEXT TOKENIZATION
-# ==========================================
-
-def tokenize(text):
-
-    return re.findall(
-        r"[a-zA-Z0-9]+",
-        text.lower()
-    )
-
-
-# ==========================================
-# 7. BM25 RETRIEVAL
+# 8. BM25 DOCUMENT RETRIEVAL
 # ==========================================
 
 def retrieve_documents(question):
@@ -230,7 +233,10 @@ def retrieve_documents(question):
     document_frequencies = Counter()
 
     for tokens in tokenized_docs:
-        document_frequencies.update(set(tokens))
+
+        document_frequencies.update(
+            set(tokens)
+        )
 
     k1 = 1.5
     b = 0.75
@@ -247,7 +253,10 @@ def retrieve_documents(question):
 
         for term in set(query_terms):
 
-            frequency = term_counts.get(term, 0)
+            frequency = term_counts.get(
+                term,
+                0
+            )
 
             if frequency == 0:
                 continue
@@ -287,106 +296,291 @@ def retrieve_documents(question):
 
 
 # ==========================================
-# 8. SIDEBAR
+# 9. QUESTION-FOCUSED ANSWER EXTRACTION
+# ==========================================
+
+def generate_document_answer(question, results):
+
+    if not results:
+
+        return {
+            "answer": (
+                "I could not find relevant information "
+                "in the uploaded documents."
+            ),
+            "sources": [],
+            "evidence": []
+        }
+
+    stop_words = {
+        "what", "is", "are", "was", "were",
+        "the", "a", "an", "of", "in", "on",
+        "at", "to", "for", "and", "or",
+        "how", "why", "when", "where", "who",
+        "which", "explain", "describe", "tell",
+        "me", "about", "does", "do", "did",
+        "can", "could", "would", "should",
+        "has", "have", "had", "with", "from",
+        "this", "that", "these", "those"
+    }
+
+    query_terms = [
+        word for word in tokenize(question)
+        if word not in stop_words
+    ]
+
+    if not query_terms:
+
+        return {
+            "answer": (
+                "Please enter a more specific question."
+            ),
+            "sources": [],
+            "evidence": []
+        }
+
+    query_set = set(query_terms)
+
+    candidates = []
+
+    for result in results:
+
+        sentences = re.split(
+            r"(?<=[.!?])\s+",
+            result["text"]
+        )
+
+        for sentence in sentences:
+
+            sentence = sentence.strip()
+
+            if len(sentence.split()) < 4:
+                continue
+
+            sentence_tokens = [
+                word for word in tokenize(sentence)
+                if word not in stop_words
+            ]
+
+            sentence_set = set(sentence_tokens)
+
+            if not sentence_set:
+                continue
+
+            matching_terms = query_set.intersection(
+                sentence_set
+            )
+
+            if not matching_terms:
+                continue
+
+            coverage = (
+                len(matching_terms) / len(query_set)
+            )
+
+            relevance = (
+                len(matching_terms) / len(sentence_set)
+            )
+
+            score = (
+                coverage * 0.7
+                + relevance * 0.3
+            )
+
+            if score >= 0.15:
+
+                candidates.append({
+                    "text": sentence,
+                    "score": score,
+                    "source": result["source"],
+                    "page": result["page"]
+                })
+
+    candidates.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    if not candidates or candidates[0]["score"] < 0.20:
+
+        return {
+            "answer": (
+                "The uploaded documents do not contain "
+                "enough relevant information to answer "
+                "this question. Please try another question."
+            ),
+            "sources": [],
+            "evidence": []
+        }
+
+    selected_sentences = []
+
+    sources = []
+
+    seen_sentences = set()
+
+    evidence = []
+
+    for candidate in candidates:
+
+        sentence = candidate["text"]
+
+        if sentence.lower() in seen_sentences:
+            continue
+
+        seen_sentences.add(
+            sentence.lower()
+        )
+
+        selected_sentences.append(sentence)
+
+        evidence.append(candidate)
+
+        source_info = {
+            "source": candidate["source"],
+            "page": candidate["page"]
+        }
+
+        if source_info not in sources:
+
+            sources.append(source_info)
+
+        if len(selected_sentences) >= 3:
+            break
+
+    return {
+        "answer": " ".join(selected_sentences),
+        "sources": sources,
+        "evidence": evidence
+    }
+
+
+# ==========================================
+# 10. SIDEBAR
 # ==========================================
 
 with st.sidebar:
 
-    st.header("Project Settings")
+    st.header("About Project")
 
-    st.write("**Retrieval Method**")
-    st.code("BM25 Keyword Retrieval")
-
-    st.write("**Chunk Size:**", CHUNK_SIZE)
-
-    st.write("**Chunk Overlap:**", CHUNK_OVERLAP)
-
-    st.write("**Top Results:**", TOP_K)
+    st.write(
+        "RAG Document Assistant uses BM25 keyword "
+        "retrieval and question-focused sentence extraction."
+    )
 
     st.divider()
 
-    st.success("Lightweight retrieval mode active")
+    st.subheader("Technologies")
 
-    st.info(
-        "No OpenAI key, Hugging Face token, "
-        "or embedding model is required."
+    st.write("• Python")
+    st.write("• Streamlit")
+    st.write("• PyPDF")
+    st.write("• BM25 Retrieval")
+
+    st.divider()
+
+    st.write(
+        f"Processed documents: "
+        f"{len(st.session_state.processed_files)}"
     )
+
+    st.write(
+        f"Total chunks: "
+        f"{len(st.session_state.chunks)}"
+    )
+
+    if st.button("Clear Documents"):
+
+        st.session_state.chunks = []
+
+        st.session_state.processed_files = []
+
+        st.session_state.last_answer = None
+
+        st.rerun()
 
 
 # ==========================================
-# 9. DOCUMENT UPLOAD
+# 11. DOCUMENT UPLOAD
 # ==========================================
 
 st.header("1. Upload Documents")
 
 uploaded_files = st.file_uploader(
-    "Choose PDF, TXT or MD files",
+    "Upload your PDF, TXT, or MD documents",
     type=["pdf", "txt", "md"],
     accept_multiple_files=True
 )
 
-if uploaded_files:
 
-    st.subheader("Selected Documents")
+# ==========================================
+# 12. PROCESS DOCUMENTS
+# ==========================================
 
-    for file in uploaded_files:
+st.header("2. Process Documents")
 
-        st.write(
-            f"📄 {file.name} "
-            f"({file.size / 1024:.2f} KB)"
+if st.button(
+    "Process Documents",
+    type="primary"
+):
+
+    if not uploaded_files:
+
+        st.warning(
+            "Please upload at least one document."
         )
 
-    if st.button("Process Documents", type="primary"):
+    else:
 
         try:
 
-            with st.spinner("Processing documents..."):
+            with st.spinner(
+                "Extracting and processing documents..."
+            ):
 
-                total_chunks = process_documents(
-                    uploaded_files
+                chunks, processed_files = (
+                    process_documents(uploaded_files)
                 )
 
-            st.success(
-                f"Successfully processed {total_chunks} chunks!"
-            )
+            if not chunks:
+
+                st.warning(
+                    "No readable text found in the uploaded documents."
+                )
+
+            else:
+
+                st.session_state.chunks = chunks
+
+                st.session_state.processed_files = (
+                    processed_files
+                )
+
+                st.session_state.last_answer = None
+
+                st.success(
+                    "Documents processed successfully!"
+                )
+
+                st.write(
+                    f"Total chunks created: {len(chunks)}"
+                )
+
+                st.write("Processed files:")
+
+                for filename in processed_files:
+
+                    st.write(f"📄 {filename}")
 
         except Exception as error:
 
             st.error(
-                f"Processing failed: {error}"
+                f"Document processing failed: {error}"
             )
 
 
 # ==========================================
-# 10. KNOWLEDGE BASE STATUS
-# ==========================================
-
-st.divider()
-
-st.header("2. Knowledge Base Status")
-
-col1, col2 = st.columns(2)
-
-col1.metric(
-    "Stored Chunks",
-    len(st.session_state.chunks)
-)
-
-col2.metric(
-    "Processed Documents",
-    len(st.session_state.processed_files)
-)
-
-if st.session_state.processed_files:
-
-    st.write("**Processed files:**")
-
-    for filename in st.session_state.processed_files:
-        st.write(f"📄 {filename}")
-
-
-# ==========================================
-# 11. ASK QUESTIONS
+# 13. ASK QUESTIONS
 # ==========================================
 
 st.divider()
@@ -398,11 +592,13 @@ question = st.text_input(
     placeholder="What is the main topic of my document?"
 )
 
-if st.button("Retrieve Relevant Information"):
+if st.button("Get Answer"):
 
     if not question.strip():
 
-        st.warning("Please enter a question.")
+        st.warning(
+            "Please enter a question."
+        )
 
     elif not st.session_state.chunks:
 
@@ -414,83 +610,86 @@ if st.button("Retrieve Relevant Information"):
 
         try:
 
-            with st.spinner("Searching documents..."):
+            with st.spinner(
+                "Searching documents and extracting an answer..."
+            ):
 
                 results = retrieve_documents(question)
 
-            if not results:
-
-                st.warning(
-                    "No matching passages found. "
-                    "Try using different keywords."
+                answer_result = generate_document_answer(
+                    question,
+                    results
                 )
 
-            else:
-
-                st.success(
-                    f"Retrieved {len(results)} relevant passages."
+                st.session_state.last_answer = (
+                    answer_result
                 )
 
-                st.subheader("Retrieved Information")
+            st.success(
+                "Question processing completed!"
+            )
 
-                for index, result in enumerate(
-                    results, start=1
-                ):
-
-                    with st.expander(
-                        f"Result {index}: {result['source']}"
-                    ):
-
-                        st.write(result["text"])
-
-                        st.caption(
-                            f"Source: {result['source']} | "
-                            f"Page: {result['page']} | "
-                            f"BM25 Score: {result['score']:.4f}"
-                        )
-
-                st.subheader("Sources")
-
-                unique_sources = {}
-
-                for result in results:
-
-                    source = result["source"]
-
-                    if source not in unique_sources:
-                        unique_sources[source] = set()
-
-                    unique_sources[source].add(
-                        str(result["page"])
-                    )
-
-                for source, pages in unique_sources.items():
-
-                    page_list = ", ".join(
-                        sorted(pages, key=lambda x: int(x))
-                    )
-
-                    st.write(
-                        f"📄 **{source}** — Pages: {page_list}"
-                    )
-
-                st.info(
-                    "Retrieval completed. "
-                    "This lightweight deployment uses keyword-based "
-                    "BM25 retrieval, not semantic embeddings or "
-                    "AI-generated answers."
-                )
         except Exception as error:
-            st.error(f"Retrieval failed: {error}")
+
+            st.error(
+                f"Answer extraction failed: {error}"
+            )
 
 
 # ==========================================
-# 12. FOOTER
+# 14. DISPLAY ANSWER
+# ==========================================
+
+if st.session_state.last_answer:
+
+    answer_result = st.session_state.last_answer
+
+    st.subheader("Answer")
+
+    st.info(
+        answer_result["answer"]
+    )
+
+    if answer_result["sources"]:
+
+        st.subheader("Answer Sources")
+
+        for source in answer_result["sources"]:
+
+            st.write(
+                f"📄 **{source['source']}** "
+                f"— Page: {source['page']}"
+            )
+
+    if answer_result["evidence"]:
+
+        with st.expander(
+            "View supporting document sentences"
+        ):
+
+            for index, item in enumerate(
+                answer_result["evidence"],
+                start=1
+            ):
+
+                st.write(
+                    f"**{index}.** {item['text']}"
+                )
+
+                st.caption(
+                    f"Source: {item['source']} | "
+                    f"Page: {item['page']}"
+                )
+
+
+# ==========================================
+# 15. FOOTER
 # ==========================================
 
 st.divider()
 
 st.caption(
     "RAG Document Assistant | "
-    "Python | Streamlit | PyPDF | BM25"
+    "Python | Streamlit | PyPDF | BM25 | "
+    "Question-Focused Answer Extraction"
 )
