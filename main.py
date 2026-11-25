@@ -203,6 +203,7 @@ def process_documents(uploaded_files):
 # 8. BM25 DOCUMENT RETRIEVAL
 # ==========================================
 
+
 def retrieve_documents(question):
 
     documents = st.session_state.chunks
@@ -210,13 +211,29 @@ def retrieve_documents(question):
     if not documents:
         return []
 
-    query_terms = tokenize(question)
+    def normalize_word(word):
+        word = word.lower()
+
+        if len(word) > 4 and word.endswith("ies"):
+            return word[:-3] + "y"
+
+        if len(word) > 3 and word.endswith("s"):
+            return word[:-1]
+
+        return word
+
+    query_terms = [
+        normalize_word(word)
+        for word in tokenize(question)
+    ]
+
+    query_terms = list(set(query_terms))
 
     if not query_terms:
         return []
 
     tokenized_docs = [
-        tokenize(item["text"])
+        [normalize_word(word) for word in tokenize(item["text"])]
         for item in documents
     ]
 
@@ -233,10 +250,7 @@ def retrieve_documents(question):
     document_frequencies = Counter()
 
     for tokens in tokenized_docs:
-
-        document_frequencies.update(
-            set(tokens)
-        )
+        document_frequencies.update(set(tokens))
 
     k1 = 1.5
     b = 0.75
@@ -246,17 +260,12 @@ def retrieve_documents(question):
     for index, tokens in enumerate(tokenized_docs):
 
         term_counts = Counter(tokens)
-
         document_length = len(tokens)
-
         score = 0.0
 
-        for term in set(query_terms):
+        for term in query_terms:
 
-            frequency = term_counts.get(
-                term,
-                0
-            )
+            frequency = term_counts.get(term, 0)
 
             if frequency == 0:
                 continue
@@ -264,15 +273,11 @@ def retrieve_documents(question):
             df = document_frequencies[term]
 
             idf = math.log(
-                1 + (
-                    document_count - df + 0.5
-                ) / (df + 0.5)
+                1 + (document_count - df + 0.5) / (df + 0.5)
             )
 
             denominator = frequency + k1 * (
-                1 - b + b * (
-                    document_length / average_length
-                )
+                1 - b + b * (document_length / average_length)
             )
 
             score += idf * (
@@ -280,11 +285,8 @@ def retrieve_documents(question):
             ) / denominator
 
         if score > 0:
-
             result = documents[index].copy()
-
             result["score"] = score
-
             scored_results.append(result)
 
     scored_results.sort(
@@ -294,19 +296,18 @@ def retrieve_documents(question):
 
     return scored_results[:TOP_K]
 
-
 # ==========================================
 # 9. QUESTION-FOCUSED ANSWER EXTRACTION
 # ==========================================
 
+
 def generate_document_answer(question, results):
 
     if not results:
-
         return {
             "answer": (
-                "I could not find relevant information "
-                "in the uploaded documents."
+                "No matching document sections were found. "
+                "Try using important terms from your document."
             ),
             "sources": [],
             "evidence": []
@@ -321,25 +322,35 @@ def generate_document_answer(question, results):
         "me", "about", "does", "do", "did",
         "can", "could", "would", "should",
         "has", "have", "had", "with", "from",
-        "this", "that", "these", "those"
+        "this", "that", "these", "those",
+        "give", "list", "define", "discuss",
+        "write", "mention", "briefly"
     }
 
-    query_terms = [
-        word for word in tokenize(question)
+    def normalize_word(word):
+
+        word = word.lower()
+
+        if len(word) > 4 and word.endswith("ies"):
+            return word[:-3] + "y"
+
+        if len(word) > 3 and word.endswith("s"):
+            return word[:-1]
+
+        return word
+
+    query_terms = {
+        normalize_word(word)
+        for word in tokenize(question)
         if word not in stop_words
-    ]
+    }
 
     if not query_terms:
-
         return {
-            "answer": (
-                "Please enter a more specific question."
-            ),
+            "answer": "Please enter a more specific question.",
             "sources": [],
             "evidence": []
         }
-
-    query_set = set(query_terms)
 
     candidates = []
 
@@ -357,69 +368,61 @@ def generate_document_answer(question, results):
             if len(sentence.split()) < 4:
                 continue
 
-            sentence_tokens = [
-                word for word in tokenize(sentence)
+            sentence_tokens = {
+                normalize_word(word)
+                for word in tokenize(sentence)
                 if word not in stop_words
-            ]
+            }
 
-            sentence_set = set(sentence_tokens)
-
-            if not sentence_set:
+            if not sentence_tokens:
                 continue
 
-            matching_terms = query_set.intersection(
-                sentence_set
+            matching_terms = query_terms.intersection(
+                sentence_tokens
             )
 
             if not matching_terms:
                 continue
 
             coverage = (
-                len(matching_terms) / len(query_set)
+                len(matching_terms) / len(query_terms)
             )
 
             relevance = (
-                len(matching_terms) / len(sentence_set)
+                len(matching_terms) / len(sentence_tokens)
             )
 
             score = (
-                coverage * 0.7
-                + relevance * 0.3
+                coverage * 0.75
+                + relevance * 0.25
             )
 
-            if score >= 0.15:
-
-                candidates.append({
-                    "text": sentence,
-                    "score": score,
-                    "source": result["source"],
-                    "page": result["page"]
-                })
+            candidates.append({
+                "text": sentence,
+                "score": score,
+                "source": result["source"],
+                "page": result["page"]
+            })
 
     candidates.sort(
         key=lambda item: item["score"],
         reverse=True
     )
 
-    if not candidates or candidates[0]["score"] < 0.20:
-
+    if not candidates:
         return {
             "answer": (
-                "The uploaded documents do not contain "
-                "enough relevant information to answer "
-                "this question. Please try another question."
+                "No exact keyword matches were found. "
+                "Try asking with important words from the document."
             ),
             "sources": [],
             "evidence": []
         }
 
     selected_sentences = []
-
-    sources = []
-
-    seen_sentences = set()
-
     evidence = []
+    sources = []
+    seen_sentences = set()
 
     for candidate in candidates:
 
@@ -428,12 +431,9 @@ def generate_document_answer(question, results):
         if sentence.lower() in seen_sentences:
             continue
 
-        seen_sentences.add(
-            sentence.lower()
-        )
+        seen_sentences.add(sentence.lower())
 
         selected_sentences.append(sentence)
-
         evidence.append(candidate)
 
         source_info = {
@@ -442,14 +442,24 @@ def generate_document_answer(question, results):
         }
 
         if source_info not in sources:
-
             sources.append(source_info)
 
         if len(selected_sentences) >= 3:
             break
 
+    if candidates[0]["score"] < 0.15:
+
+        answer = (
+            "I found some potentially related information, "
+            "but it may not fully answer your question:\n\n"
+        ) + " ".join(selected_sentences)
+
+    else:
+
+        answer = " ".join(selected_sentences)
+
     return {
-        "answer": " ".join(selected_sentences),
+        "answer": answer,
         "sources": sources,
         "evidence": evidence
     }
